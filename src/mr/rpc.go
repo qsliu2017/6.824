@@ -6,8 +6,13 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
+
+type Mapf func(filename string, contents string) []KeyValue
+type Reducef func(key string, valuse []string) string
 
 //
 // example to show how to declare the arguments
@@ -23,7 +28,6 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
