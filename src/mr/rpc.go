@@ -49,6 +49,7 @@ type ReduceTask struct {
 }
 
 type GetTaskArgs struct {
+	WorkerId int
 }
 
 type GetTaskReply struct {
@@ -58,12 +59,19 @@ type GetTaskReply struct {
 }
 
 type DoneTaskArgs struct {
+	Type     TaskType
+	Id       int
+	WorkerId int
+}
+
+type DoneTaskReply struct{}
+
+type PingArgs struct {
 	Type TaskType
 	Id   int
 }
 
-type DoneTaskReply struct {
-}
+type PingReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

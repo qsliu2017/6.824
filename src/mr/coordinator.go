@@ -8,27 +8,72 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 type Coordinator struct {
 	m sync.Mutex
 
-	Files         []string
-	mapDispatched []bool
-	mapDone       []bool
+	mt []mapTask
 
-	NReduce          int
-	reduceDispatched []bool
-	reduceDone       []bool
+	rt []reduceTask
 }
 
-func Fisrt[T any](array []T, pred func(T) bool) (int, bool) {
+func (c *Coordinator) NMap() int    { return len(c.mt) }
+func (c *Coordinator) NReduce() int { return len(c.rt) }
+
+type mapTask struct {
+	task
+	file string
+}
+
+type reduceTask struct {
+	task
+}
+
+type task struct {
+	ping   chan struct{}
+	done   chan struct{}
+	state  taskState
+	worker int
+}
+
+type taskState int
+
+const (
+	IDLE taskState = iota
+	IN_PROGRESS
+	COMPLETED
+)
+
+func (s taskState) String() string {
+	switch s {
+	case IDLE:
+		return "idle"
+	case IN_PROGRESS:
+		return "in-progress"
+	case COMPLETED:
+		return "completed"
+	default:
+		return "unknown"
+	}
+}
+
+func Fisrt[T any](array []T, pred func(T) bool) (int, *T) {
 	for i, v := range array {
 		if pred(v) {
-			return i, true
+			return i, &array[i]
 		}
 	}
-	return 0, false
+	return 0, nil
+}
+
+func Timeout[T any](ch <-chan T, d time.Duration, timeoutF func()) {
+	select {
+	case <-ch:
+	case <-time.After(d):
+		timeoutF()
+	}
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -37,40 +82,64 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	_, someMapUndone := Fisrt(c.mapDone, func(done bool) bool { return !done })
+	if _, mIncompleted := Fisrt(c.mt, func(m mapTask) bool { return m.state != COMPLETED }); mIncompleted != nil {
 
-	if someMapUndone {
-		id, someUndispatched := Fisrt(c.mapDispatched, func(dispatched bool) bool { return !dispatched })
+		if id, m := Fisrt(c.mt, func(mt mapTask) bool { return mt.state == IDLE }); m != nil {
+			m.state = IN_PROGRESS
+			m.worker = args.WorkerId
 
-		if someUndispatched {
-			c.mapDispatched[id] = true
 			reply.Type = MapType
 			reply.MapTask = &MapTask{
 				Id:       id,
-				NReduce:  c.NReduce,
-				Filename: c.Files[id],
+				NReduce:  c.NReduce(),
+				Filename: m.file,
 			}
+			go c.acceptHeartbeat(&m.task)
 			return nil
 		}
 
-		// all map tasks dispatched, wait
+		// all map tasks in progress, wait
 		reply.Type = WaitType
 		return nil
 	}
 
-	id, someReduceDispatched := Fisrt(c.reduceDispatched, func(dispatched bool) bool { return !dispatched })
-	if someReduceDispatched {
-		c.reduceDispatched[id] = true
-		reply.Type = ReduceType
-		reply.ReduceTask = &ReduceTask{
-			Id:   id,
-			NMap: len(c.Files),
+	if _, rIncompleted := Fisrt(c.rt, func(r reduceTask) bool { return r.state != COMPLETED }); rIncompleted != nil {
+
+		if id, r := Fisrt(c.rt, func(r reduceTask) bool { return r.state == IDLE }); r != nil {
+			r.state = IN_PROGRESS
+			r.worker = args.WorkerId
+
+			reply.Type = ReduceType
+			reply.ReduceTask = &ReduceTask{
+				Id:   id,
+				NMap: c.NMap(),
+			}
+			go c.acceptHeartbeat(&r.task)
+			return nil
 		}
+
+		reply.Type = WaitType
 		return nil
 	}
 
 	reply.Type = DoneType
 	return nil
+}
+
+func (c *Coordinator) acceptHeartbeat(t *task) {
+	for {
+		select {
+		case <-time.After(3 * time.Second):
+			// log.Printf("map task has not receive response for 3s")
+			c.m.Lock()
+			t.state = IDLE
+			c.m.Unlock()
+		case <-t.done:
+			return
+		case <-t.ping:
+			continue
+		}
+	}
 }
 
 func (c *Coordinator) DoneTask(args *DoneTaskArgs, reply *DoneTaskReply) error {
@@ -79,9 +148,31 @@ func (c *Coordinator) DoneTask(args *DoneTaskArgs, reply *DoneTaskReply) error {
 
 	switch args.Type {
 	case MapType:
-		c.mapDone[args.Id] = true
+		m := &c.mt[args.Id]
+		m.state = COMPLETED
+		m.done <- struct{}{}
 	case ReduceType:
-		c.reduceDone[args.Id] = true
+		r := &c.rt[args.Id]
+		r.state = COMPLETED
+		r.done <- struct{}{}
+	default:
+		return fmt.Errorf("unexpected done task type: %v", args.Type)
+	}
+
+	return nil
+}
+
+func (c *Coordinator) Ping(args *PingArgs, reply *PingReply) error {
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	switch args.Type {
+	case MapType:
+		m := &c.mt[args.Id]
+		m.ping <- struct{}{}
+	case ReduceType:
+		r := &c.rt[args.Id]
+		r.ping <- struct{}{}
 	default:
 		return fmt.Errorf("unexpected done task type: %v", args.Type)
 	}
@@ -123,8 +214,8 @@ func (c *Coordinator) Done() bool {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	_, someReduceUndone := Fisrt(c.reduceDone, func(done bool) bool { return !done })
-	return !someReduceUndone
+	_, rIncompleted := Fisrt(c.rt, func(r reduceTask) bool { return r.state != COMPLETED })
+	return rIncompleted == nil
 }
 
 //
@@ -134,15 +225,23 @@ func (c *Coordinator) Done() bool {
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		Files:            files,
-		mapDispatched:    make([]bool, len(files)),
-		mapDone:          make([]bool, len(files)),
-		NReduce:          nReduce,
-		reduceDispatched: make([]bool, nReduce),
-		reduceDone:       make([]bool, nReduce),
+		mt: make([]mapTask, len(files)),
+		rt: make([]reduceTask, nReduce),
 	}
 
-	// Your code here.
+	for i := range c.mt {
+		m := &c.mt[i]
+		m.file = files[i]
+		m.state = IDLE
+		m.done = make(chan struct{})
+		m.ping = make(chan struct{})
+	}
+
+	for i := range c.rt {
+		r := &c.rt[i]
+		r.done = make(chan struct{})
+		r.ping = make(chan struct{})
+	}
 
 	c.server()
 	return &c

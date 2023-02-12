@@ -38,10 +38,16 @@ loop:
 		t, m, r := getTask()
 		switch t {
 		case MapType:
+			done := make(chan struct{})
+			go sendHeartbeat(done, t, m.Id)
 			doMap(mapf, *m)
+			done <- struct{}{}
 			doneTask(MapType, m.Id)
 		case ReduceType:
+			done := make(chan struct{})
+			go sendHeartbeat(done, t, r.Id)
 			doReduce(reducef, *r)
+			done <- struct{}{}
 			doneTask(ReduceType, r.Id)
 		case WaitType:
 			time.Sleep(time.Microsecond)
@@ -54,7 +60,9 @@ loop:
 }
 
 func getTask() (TaskType, *MapTask, *ReduceTask) {
-	args := GetTaskArgs{}
+	args := GetTaskArgs{
+		WorkerId: os.Getpid(),
+	}
 
 	reply := GetTaskReply{}
 
@@ -135,13 +143,37 @@ func doReduce(reducef Reducef, t ReduceTask) {
 
 func doneTask(type_ TaskType, id int) {
 	args := DoneTaskArgs{
-		Type: type_,
-		Id:   id,
+		Type:     type_,
+		Id:       id,
+		WorkerId: os.Getpid(),
 	}
 	reply := DoneTaskReply{}
 	ok := call("Coordinator.DoneTask", &args, &reply)
 	if !ok {
 		log.Fatalln("done task failed!")
+	}
+}
+
+func ping(type_ TaskType, id int) {
+	args := PingArgs{
+		Type: type_,
+		Id:   id,
+	}
+	reply := PingReply{}
+	ok := call("Coordinator.Ping", &args, &reply)
+	if !ok {
+		log.Fatalln("ping failed!")
+	}
+}
+
+func sendHeartbeat(done <-chan struct{}, type_ TaskType, id int) {
+	for {
+		select {
+		case <-time.After(time.Microsecond):
+			ping(type_, id)
+		case <-done:
+			return
+		}
 	}
 }
 
