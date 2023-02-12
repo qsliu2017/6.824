@@ -266,6 +266,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.log(dLog, "make and init server")
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -274,4 +275,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func (rf *Raft) log(topic logTopic, format string, a ...interface{}) {
+	DPrintf(topic, rf.me, format, a...)
 }
