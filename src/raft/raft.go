@@ -177,7 +177,8 @@ type RequestVoteReply struct {
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.log(dVote, "<- S%d(term=%d) RequestVote", args.CandidateId, args.Term)
+	rf.log(dVote, "<- S%d RequestVote(args: %+v, ...)", args.CandidateId, args)
+	defer rf.log(dVote, "<- S%d RequestVote(..., reply: %+v)", args.CandidateId, reply)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -235,7 +236,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	rf.log(dInfo, "-> S%d send RequestVote", server)
+	rf.log(dVote, "sendRequestVote(S%d, args: %+v, ...)", server, args)
+	defer rf.log(dVote, "sendRequestVote(S%d, ..., reply: %+v)", server, reply)
 
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
@@ -260,7 +262,8 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.log(dInfo, "<- S%d(term=%d) AppendEntries", args.LeaderId, args.Term)
+	rf.log(dLog, "<- S%d AppendEntries(args: %+v, ...)", args.LeaderId, args)
+	defer rf.log(dLog, "<- S%d AppendEntries(..., reply: %+v)", args.LeaderId, reply)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -298,6 +301,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.log(dLeader, "sendAppendEntries(S%d, args: %+v, ...)", server, args)
+	defer rf.log(dLeader, "sendAppendEntries(S%d, ..., %+v)", server, reply)
+
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
