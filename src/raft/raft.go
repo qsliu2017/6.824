@@ -65,20 +65,24 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	term  int
-	state ServerState
-	ping  chan struct{}
+	currentTerm int  // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    *int // candidateId that received vote in current term (or null if none)
+	s           State
+
+	ping chan struct{}
 }
 
-type ServerState int
+type State int
 
 const (
-	Follower ServerState = 1 + iota
+	Follower State = 1 << iota
 	Candidate
 	Leader
 )
 
-func (s ServerState) String() string {
+func (s State) to(t State) int { return int(s | t<<3) }
+
+func (s State) String() string {
 	switch s {
 	case Follower:
 		return "follower"
@@ -91,7 +95,7 @@ func (s ServerState) String() string {
 	}
 }
 
-func (rf *Raft) isLeader() bool { return rf.state == Leader }
+func (rf *Raft) isLeader() bool { return rf.s == Leader }
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -100,7 +104,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	// Your code here (2A).
-	return rf.term, rf.isLeader()
+	return rf.currentTerm, rf.isLeader()
 }
 
 //
@@ -161,40 +165,43 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-
-	Candidate int
-	Term      int
+	Term        int // candidate requesting vote
+	CandidateId int // candidate requesting vote
 }
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
 type RequestVoteReply struct {
-	// Your data here (2A).
-
-	Vote bool
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
-//
-// example RequestVote RPC handler.
-//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.log(dVote, "<- S%d(term=%d) RequestVote", args.Candidate, args.Term)
+	rf.log(dVote, "<- S%d(term=%d) RequestVote", args.CandidateId, args.Term)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.term < args.Term {
-		reply.Vote = true
-		rf.term = args.Term
+	reply.Term = rf.currentTerm
+
+	// 1. Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+		return
+	}
+
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = nil
+		// rf.convertTo(Follower)
+	}
+
+	// 2. If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
+	if rf.votedFor == nil || *rf.votedFor == args.CandidateId {
+		reply.VoteGranted = true
+		rf.votedFor = &args.CandidateId
+		return
 	}
 }
 
@@ -228,38 +235,78 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	rf.log(dInfo, "-> S%d send RequestVote", server)
+
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.votedFor = nil
+		// rf.convertTo(Follower)
+	}
+
 	return ok
 }
 
 type AppendEntriesArgs struct {
-	Leader int
-	Term   int
+	Term     int // leader’s term
+	LeaderId int // so follower can redirect clients
 }
 
-type AppendEntriesReply struct{}
+type AppendEntriesReply struct {
+	Term    int  // currentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.log(dInfo, "<- S%d(term=%d) AppendEntries", args.Leader, args.Term)
+	rf.log(dInfo, "<- S%d(term=%d) AppendEntries", args.LeaderId, args.Term)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	switch {
-	case rf.term > args.Term:
-		rf.log(dInfo, "ignore")
-	case rf.term == args.Term:
-		rf.ping <- struct{}{}
-	case rf.term < args.Term:
-		rf.term = args.Term
-		rf.log(dInfo, "S%d has a higher term %d, update", args.Leader, args.Term)
-		rf.state = Follower
+	reply.Term = rf.currentTerm
+
+	// 1. Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
 	}
+
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = nil
+		// rf.convertTo(Follower)
+		rf.s = Follower
+	}
+
+	if rf.currentTerm == args.Term {
+		rf.ping <- struct{}{}
+	}
+
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+
+	reply.Success = true
+
+	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+
+	// 4. Append any new entries not already in the log
+
+	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.votedFor = nil
+		// rf.convertTo(Follower)
+	}
+
 	return ok
 }
 
@@ -331,22 +378,22 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) newElection() {
-	rf.state = Candidate
-	rf.term += 1
-	rf.log(dTerm, "start new election (new_term=%d)", rf.term)
+	rf.s = Candidate
+	rf.currentTerm += 1
+	rf.log(dTerm, "start new election (new_term=%d)", rf.currentTerm)
 
 	var nVote int32
 	var wg sync.WaitGroup
 	args := &RequestVoteArgs{
-		Term:      rf.term,
-		Candidate: rf.me,
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
 	}
 	rf.forEach(func(peer *labrpc.ClientEnd, server int) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			reply := &RequestVoteReply{}
-			if rf.sendRequestVote(server, args, reply) && reply.Vote {
+			if rf.sendRequestVote(server, args, reply) && reply.VoteGranted {
 				rf.log(dVote, "<- S%d vote", server)
 				atomic.AddInt32(&nVote, 1)
 			}
@@ -356,11 +403,11 @@ func (rf *Raft) newElection() {
 
 	rf.log(dVote, "gets %d votes", nVote)
 	if int(nVote) >= len(rf.peers)/2 {
-		rf.state = Leader
+		rf.s = Leader
 		go func() {
 			for rf.isLeader() {
 				rf.forEach(func(_ *labrpc.ClientEnd, server int) {
-					go rf.sendAppendEntries(server, &AppendEntriesArgs{Leader: rf.me, Term: rf.term}, &AppendEntriesReply{})
+					go rf.sendAppendEntries(server, &AppendEntriesArgs{LeaderId: rf.me, Term: rf.currentTerm}, &AppendEntriesReply{})
 				})
 				time.Sleep(300 * time.Millisecond)
 			}
@@ -399,8 +446,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.log(dLog, "make and init server")
 
-	rf.term = 0
-	rf.state = Follower
+	rf.currentTerm = 0
+	rf.s = Follower
 	rf.ping = make(chan struct{})
 
 	// initialize from state persisted before a crash
