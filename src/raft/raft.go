@@ -251,7 +251,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	rf.log(dVote, "sendRequestVote(S%d, args: %+v, ...)", server, args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	defer rf.log(dVote, "sendRequestVote(S%d, ..., reply: %+v) -> %v", server, reply, ok)
+	rf.log(dVote, "sendRequestVote(S%d, ..., reply: %+v) -> %v", server, reply, ok)
 	return ok
 }
 
@@ -273,6 +273,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.rwmu.Unlock()
 
 	reply.Term = rf.currentTerm
+	reply.Success = true
 
 	// 1. Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -290,8 +291,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 
-	reply.Success = true
-
 	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
 
 	// 4. Append any new entries not already in the log
@@ -303,7 +302,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	rf.log(dLeader, "sendAppendEntries(S%d, args: %+v, ...)", server, args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	defer rf.log(dLeader, "sendAppendEntries(S%d, ..., %+v) -> %v", server, reply, ok)
+	rf.log(dLeader, "sendAppendEntries(S%d, ..., %+v) -> %v", server, reply, ok)
 	return ok
 }
 
@@ -384,11 +383,7 @@ func (rf *Raft) ticker() {
 
 // The heartbeat go routine
 func (rf *Raft) heartbeat() {
-	rf.continueHeartbeat.L.Lock()
-	for !rf.isLeader() {
-		rf.continueHeartbeat.Wait()
-	}
-	rf.continueHeartbeat.L.Unlock()
+	rf.heartbeatWait()
 	rf.log(dTimer, "heartbeat start")
 
 	for !rf.killed() {
@@ -397,11 +392,7 @@ func (rf *Raft) heartbeat() {
 		case <-time.After(HeartbeatInterval):
 		case <-rf.pauseHeartbeat:
 			rf.log(dTimer, "heartbeat pause")
-			rf.continueHeartbeat.L.Lock()
-			for !rf.isLeader() {
-				rf.continueHeartbeat.Wait()
-			}
-			rf.continueHeartbeat.L.Unlock()
+			rf.heartbeatWait()
 			rf.log(dTimer, "heartbeat continue")
 		}
 	}
@@ -419,6 +410,15 @@ func (rf *Raft) heartbeatOnce() {
 		}
 		go rf.sendAppendEntries(server, &AppendEntriesArgs{Term: term, LeaderId: rf.me}, &AppendEntriesReply{})
 	}
+}
+
+// heartbeatWait waits for continueHeartbeat
+func (rf *Raft) heartbeatWait() {
+	rf.continueHeartbeat.L.Lock()
+	for !rf.isLeader() {
+		rf.continueHeartbeat.Wait()
+	}
+	rf.continueHeartbeat.L.Unlock()
 }
 
 // On conversion to candidate, start election:
